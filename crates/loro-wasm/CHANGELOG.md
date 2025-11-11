@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.1
+
+### Patch Changes
+
+- 9e0a613: fix: Reject symbol-keyed map objects in wasm conversion #855
+
 ## 1.9.0
 
 ### Minor Changes
