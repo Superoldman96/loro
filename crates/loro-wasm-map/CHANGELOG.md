@@ -1,5 +1,11 @@
 # loro-crdt-map
 
+## 1.10.4
+
+### Patch Changes
+
+- a34134d: perf: rm the event calling wrapper for ops that will not trigger events
+
 ## 1.10.3
 
 ### Patch Changes
