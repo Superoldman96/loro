@@ -1,5 +1,11 @@
 # loro-crdt-map
 
+## 1.10.6
+
+### Patch Changes
+
+- 85921d7: fix: don't hang when remapping nested containers w same ID (#911)
+
 ## 1.10.5
 
 ### Patch Changes
