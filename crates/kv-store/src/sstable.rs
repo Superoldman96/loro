@@ -449,7 +449,7 @@ impl SsTable {
             .get_or_insert_with(&block_idx, || {
                 Ok::<_, LoroError>(self.read_block(block_idx))
             })
-            .unwrap()
+            .expect("validated SSTable block cache insert should succeed")
     }
 
     pub fn contains_key(&self, key: &[u8]) -> bool {
