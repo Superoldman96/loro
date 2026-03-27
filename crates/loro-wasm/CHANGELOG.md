@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.10.9
+
+### Patch Changes
+
+- 41c687b: Fix forkAt to return errors instead of panicking on invalid frontiers and shallow docs.
+
 ## 1.10.8
 
 ### Patch Changes
