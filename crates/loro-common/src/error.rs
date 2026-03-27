@@ -1,3 +1,8 @@
+use std::{
+    backtrace::{Backtrace, BacktraceStatus},
+    panic::Location,
+};
+
 use serde_columnar::ColumnarError;
 use thiserror::Error;
 
@@ -102,6 +107,16 @@ pub enum LoroError {
     ImportUnsupportedEncodingMode,
 }
 
+impl LoroError {
+    #[track_caller]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Unknown(format_internal_error_message(
+            message.into(),
+            Location::caller(),
+        ))
+    }
+}
+
 #[derive(Error, Debug, PartialEq)]
 pub enum LoroTreeError {
     #[error("`Cycle move` occurs when moving tree nodes.")]
@@ -129,6 +144,18 @@ pub enum LoroEncodeError {
     ShallowSnapshotIncompatibleWithOldFormat,
     #[error("Cannot export shallow snapshot with unknown container type. Please upgrade the Loro version.")]
     UnknownContainer,
+    #[error("Export failed: {0}")]
+    InternalError(Box<str>),
+}
+
+impl LoroEncodeError {
+    #[track_caller]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::InternalError(format_internal_error_message(
+            message.into(),
+            Location::caller(),
+        ))
+    }
 }
 
 #[cfg(feature = "wasm")]
@@ -171,5 +198,77 @@ impl From<ColumnarError> for LoroError {
             }
             e => LoroError::Unknown(e.to_string().into_boxed_str()),
         }
+    }
+}
+
+impl From<LoroEncodeError> for LoroError {
+    fn from(value: LoroEncodeError) -> Self {
+        match value {
+            LoroEncodeError::FrontiersNotFound(frontiers) => {
+                LoroError::NotFoundError(frontiers.into_boxed_str())
+            }
+            LoroEncodeError::ShallowSnapshotIncompatibleWithOldFormat
+            | LoroEncodeError::UnknownContainer => {
+                LoroError::Unknown(value.to_string().into_boxed_str())
+            }
+            LoroEncodeError::InternalError(msg) => LoroError::Unknown(msg),
+        }
+    }
+}
+
+impl From<LoroError> for LoroEncodeError {
+    fn from(value: LoroError) -> Self {
+        match value {
+            LoroError::FrontiersNotFound(id) => {
+                LoroEncodeError::FrontiersNotFound(format!("{id:?}"))
+            }
+            LoroError::NotFoundError(msg) => LoroEncodeError::FrontiersNotFound(msg.into()),
+            LoroError::Unknown(msg) => LoroEncodeError::InternalError(msg),
+            other => LoroEncodeError::InternalError(other.to_string().into_boxed_str()),
+        }
+    }
+}
+
+fn format_internal_error_message(
+    message: String,
+    location: &'static Location<'static>,
+) -> Box<str> {
+    let mut formatted = format!(
+        "{message} at {}:{}:{}",
+        location.file(),
+        location.line(),
+        location.column()
+    );
+    let backtrace = Backtrace::capture();
+    if backtrace.status() == BacktraceStatus::Captured {
+        formatted.push_str("\nBacktrace:\n");
+        formatted.push_str(&backtrace.to_string());
+    }
+
+    formatted.into_boxed_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_loro_error_contains_caller_location() {
+        let err = LoroError::internal("boom");
+        let LoroError::Unknown(msg) = err else {
+            panic!("expected unknown error");
+        };
+        assert!(msg.contains("boom"));
+        assert!(msg.contains("crates/loro-common/src/error.rs"));
+    }
+
+    #[test]
+    fn internal_encode_error_contains_caller_location() {
+        let err = LoroEncodeError::internal("boom");
+        let LoroEncodeError::InternalError(msg) = err else {
+            panic!("expected internal encode error");
+        };
+        assert!(msg.contains("boom"));
+        assert!(msg.contains("crates/loro-common/src/error.rs"));
     }
 }
