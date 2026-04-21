@@ -1,4 +1,3 @@
-use core::panic;
 use std::{
     borrow::Cow,
     mem::take,
@@ -65,12 +64,12 @@ impl crate::LoroDoc {
             ));
         }
 
-        let mut txn = Transaction::new_with_origin(self.inner.clone(), origin.into());
+        let mut txn = Transaction::new_with_origin(self.inner.clone(), origin.into())?;
 
         let obs = self.observer.clone();
         let local_update_subs_weak = self.local_update_subs.downgrade();
         txn.set_on_commit(Box::new(move |state, oplog, id_span| {
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock();
             let events = state.take_events();
             drop(state);
             for event in events {
@@ -83,8 +82,7 @@ impl crate::LoroDoc {
 
             if let Some(local_update_subs) = local_update_subs_weak.upgrade() {
                 if !local_update_subs.inner().is_empty() {
-                    let bytes =
-                        { export_fast_updates_in_range(&oplog.lock().unwrap(), &[id_span]) };
+                    let bytes = { export_fast_updates_in_range(&oplog.lock(), &[id_span]) };
                     local_update_subs.emit(&(), bytes);
                 }
             }
@@ -96,24 +94,28 @@ impl crate::LoroDoc {
     pub fn start_auto_commit(&self) {
         self.auto_commit
             .store(true, std::sync::atomic::Ordering::Release);
-        let mut self_txn = self.txn.lock().unwrap();
+        let mut self_txn = self.txn.lock();
         if self_txn.is_some() || !self.can_edit() {
             return;
         }
 
-        let txn = self.txn().unwrap();
+        let txn = self
+            .txn()
+            .expect("auto-commit should be able to create a transaction");
         self_txn.replace(txn);
     }
 
     #[inline]
     pub fn renew_txn_if_auto_commit(&self, options: Option<CommitOptions>) {
         if self.auto_commit.load(std::sync::atomic::Ordering::Acquire) && self.can_edit() {
-            let mut self_txn = self.txn.lock().unwrap();
+            let mut self_txn = self.txn.lock();
             if self_txn.is_some() {
                 return;
             }
 
-            let mut txn = self.txn().unwrap();
+            let mut txn = self
+                .txn()
+                .expect("auto-commit should be able to renew a transaction");
             if let Some(options) = options {
                 txn.set_options(options);
             }
@@ -132,7 +134,9 @@ impl crate::LoroDoc {
                 return;
             }
 
-            let mut txn = self.txn().unwrap();
+            let mut txn = self
+                .txn()
+                .expect("auto-commit should be able to renew a transaction");
             if let Some(options) = options {
                 txn.set_options(options);
             }
@@ -329,15 +333,15 @@ impl generic_btree::rle::Mergeable for EventHint {
 
 impl Transaction {
     #[inline]
-    pub fn new(doc: Arc<LoroDocInner>) -> Self {
+    pub fn new(doc: Arc<LoroDocInner>) -> LoroResult<Self> {
         Self::new_with_origin(doc.clone(), "".into())
     }
 
-    pub fn new_with_origin(doc: Arc<LoroDocInner>, origin: InternalString) -> Self {
-        let oplog_lock = doc.oplog.lock().unwrap();
-        let mut state_lock = doc.state.lock().unwrap();
+    pub fn new_with_origin(doc: Arc<LoroDocInner>, origin: InternalString) -> LoroResult<Self> {
+        let oplog_lock = doc.oplog.lock();
+        let mut state_lock = doc.state.lock();
         if state_lock.is_in_txn() {
-            panic!("Cannot start a transaction while another one is in progress");
+            return Err(LoroError::DuplicatedTransactionError);
         }
 
         state_lock.start_txn(origin, crate::event::EventTriggerKind::Local);
@@ -347,12 +351,15 @@ impl Transaction {
         let next_counter = oplog_lock.next_id(peer).counter;
         let next_lamport = oplog_lock.dag.frontiers_to_next_lamport(&frontiers);
         let latest_timestamp = oplog_lock.get_greatest_timestamp(&frontiers);
-        oplog_lock
-            .check_change_greater_than_last_peer_id(peer, next_counter, &frontiers)
-            .unwrap();
+        if let Err(err) =
+            oplog_lock.check_change_greater_than_last_peer_id(peer, next_counter, &frontiers)
+        {
+            state_lock.abort_txn();
+            return Err(err);
+        }
         drop(state_lock);
         drop(oplog_lock);
-        Self {
+        Ok(Self {
             peer,
             doc: Arc::downgrade(&doc),
             arena,
@@ -370,7 +377,7 @@ impl Transaction {
             msg: None,
             latest_timestamp,
             is_peer_first_appearance: false,
-        }
+        })
     }
 
     pub fn set_origin(&mut self, origin: InternalString) {
@@ -431,7 +438,7 @@ impl Transaction {
         };
         self.finished = true;
         if self.local_ops.is_empty() {
-            let mut state = doc.state.lock().unwrap();
+            let mut state = doc.state.lock();
             state.abort_txn();
             return Ok(Some(self.take_options()));
         }
@@ -445,7 +452,7 @@ impl Transaction {
             id: ID::new(self.peer, self.start_counter),
             timestamp: self.latest_timestamp.max(
                 self.timestamp
-                    .unwrap_or_else(|| doc.oplog.lock().unwrap().get_timestamp_for_next_txn()),
+                    .unwrap_or_else(|| doc.oplog.lock().get_timestamp_for_next_txn()),
             ),
             commit_msg: take(&mut self.msg),
         };
@@ -453,7 +460,7 @@ impl Transaction {
         let change_meta = ChangeMeta::from_change(&change);
         {
             // add change to uncommit field of oplog
-            let mut oplog = doc.oplog.lock().unwrap();
+            let mut oplog = doc.oplog.lock();
             oplog.set_uncommitted_change(change);
         }
 
@@ -467,10 +474,17 @@ impl Transaction {
             },
         );
 
-        let mut oplog = doc.oplog.lock().unwrap();
-        let mut state = doc.state.lock().unwrap();
+        let mut oplog = doc.oplog.lock();
+        let mut state = doc.state.lock();
 
-        let mut change = oplog.uncommitted_change.take().unwrap();
+        let Some(mut change) = oplog.uncommitted_change.take() else {
+            state.abort_txn();
+            drop(state);
+            drop(oplog);
+            return Err(LoroError::internal(
+                "missing uncommitted change while committing transaction",
+            ));
+        };
         modifier.modify_change(&mut change);
         let diff = if state.is_recording() {
             Some(change_to_diff(
@@ -546,13 +560,11 @@ impl Transaction {
                 expected: this_doc
                     .state
                     .lock()
-                    .unwrap()
                     .peer
                     .load(std::sync::atomic::Ordering::Relaxed),
                 found: doc
                     .state
                     .lock()
-                    .unwrap()
                     .peer
                     .load(std::sync::atomic::Ordering::Relaxed),
             });
@@ -570,8 +582,8 @@ impl Transaction {
             content,
         };
 
-        let mut oplog = doc.oplog.lock().unwrap();
-        let mut state = doc.state.lock().unwrap();
+        let mut oplog = doc.oplog.lock();
+        let mut state = doc.state.lock();
         if state.is_deleted(container) {
             return Err(LoroError::ContainerDeleted {
                 container: Box::new(state.arena.idx_to_id(container).unwrap()),
@@ -954,4 +966,35 @@ fn change_to_diff(
     }
 
     ans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{cursor::PosType, version::Frontiers};
+
+    #[test]
+    fn txn_creation_rolls_back_in_txn_after_peer_conflict() {
+        let doc = LoroDoc::new();
+        doc.set_detached_editing(true);
+        doc.set_peer_id(7).unwrap();
+
+        let text = doc.get_text("text");
+        let mut txn = doc.txn().unwrap();
+        text.insert_with_txn(&mut txn, 0, "a", PosType::Unicode)
+            .unwrap();
+        txn.commit().unwrap();
+
+        doc.checkout(&Frontiers::default()).unwrap();
+        doc.set_peer_id(7).unwrap();
+
+        let err = doc
+            .txn()
+            .expect_err("stale detached frontiers should reject reusing the same peer");
+        assert!(matches!(
+            err,
+            LoroError::ConcurrentOpsWithSamePeerID { peer: 7, .. }
+        ));
+        assert!(!doc.app_state().lock().is_in_txn());
+    }
 }

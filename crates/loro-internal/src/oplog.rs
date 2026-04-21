@@ -138,7 +138,6 @@ impl OpLog {
         self.dag.handle_new_change(&change, from_local);
         self.history_cache
             .lock()
-            .unwrap()
             .insert_by_new_change(&change, true, true);
         self.register_container_and_parent_link(&change);
         self.change_store.insert_change(change, true, from_local);
@@ -149,16 +148,16 @@ impl OpLog {
     where
         F: FnOnce(&mut ContainerHistoryCache) -> R,
     {
-        let mut history_cache = self.history_cache.lock().unwrap();
+        let mut history_cache = self.history_cache.lock();
         f(&mut history_cache)
     }
 
     pub fn has_history_cache(&self) -> bool {
-        self.history_cache.lock().unwrap().has_cache()
+        self.history_cache.lock().has_cache()
     }
 
     pub fn free_history_cache(&self) {
-        let mut history_cache = self.history_cache.lock().unwrap();
+        let mut history_cache = self.history_cache.lock();
         history_cache.free();
     }
 
@@ -225,7 +224,10 @@ impl OpLog {
 
         let mut max_last_counter = -1;
         for dep in deps.iter() {
-            let dep_vv = self.dag.get_vv(dep).unwrap();
+            let dep_vv = self
+                .dag
+                .get_vv(dep)
+                .ok_or(LoroError::FrontiersNotFound(dep))?;
             max_last_counter = max_last_counter.max(dep_vv.get(&peer).cloned().unwrap_or(0) - 1);
         }
 

@@ -1,11 +1,11 @@
+use crate::sync::{Mutex, RwLock};
 use loro_common::ContainerID;
 use rustc_hash::FxHashSet;
 
 pub use crate::container::richtext::config::{StyleConfig, StyleConfigMap};
 use crate::LoroDoc;
 use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::sync::RwLock;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct Configure {
@@ -19,7 +19,7 @@ pub struct Configure {
 
 impl LoroDoc {
     pub(crate) fn set_config(&self, config: &Configure) {
-        self.config_text_style(config.text_style_config.read().unwrap().clone());
+        self.config_text_style(config.text_style_config.read().clone());
         self.set_record_timestamp(config.record_timestamp());
         self.set_change_merge_interval(config.merge_interval());
         self.set_detached_editing(config.detached_editing());
@@ -42,9 +42,7 @@ impl Default for Configure {
 impl Configure {
     pub fn fork(&self) -> Self {
         Self {
-            text_style_config: Arc::new(RwLock::new(
-                self.text_style_config.read().unwrap().clone(),
-            )),
+            text_style_config: Arc::new(RwLock::new(self.text_style_config.read().clone())),
             record_timestamp: Arc::new(AtomicBool::new(
                 self.record_timestamp
                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -58,7 +56,7 @@ impl Configure {
                     .load(std::sync::atomic::Ordering::Relaxed),
             )),
             deleted_root_containers: Arc::new(Mutex::new(
-                self.deleted_root_containers.lock().unwrap().clone(),
+                self.deleted_root_containers.lock().clone(),
             )),
             hide_empty_root_containers: Arc::new(AtomicBool::new(
                 self.hide_empty_root_containers

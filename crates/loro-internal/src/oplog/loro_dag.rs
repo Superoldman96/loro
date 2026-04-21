@@ -137,7 +137,7 @@ impl AppDag {
         self.update_version_on_new_change(change, from_local);
         #[cfg(debug_assertions)]
         {
-            let unhandled_dep_points = self.unhandled_dep_points.lock().unwrap();
+            let unhandled_dep_points = self.unhandled_dep_points.lock();
             let c = unhandled_dep_points
                 .range(change.id_start()..change.id_end())
                 .count();
@@ -184,7 +184,7 @@ impl AppDag {
             }
             .into();
 
-            let mut map = self.map.lock().unwrap();
+            let mut map = self.map.lock();
             map.insert(node.id_start(), node);
             self.handle_deps_break_points(change.deps.iter(), change.id.peer, Some(&mut map));
         }
@@ -240,7 +240,7 @@ impl AppDag {
         f: impl FnOnce(Option<&mut AppDagNode>) -> R,
     ) -> R {
         self.lazy_load_last_of_peer(peer);
-        let mut binding = self.map.lock().unwrap();
+        let mut binding = self.map.lock();
         let last = binding
             .range_mut(..=ID::new(peer, Counter::MAX))
             .next_back()
@@ -269,7 +269,7 @@ impl AppDag {
     }
 
     pub(super) fn lazy_load_last_of_peer(&mut self, peer: u64) {
-        let unparsed_vv = self.unparsed_vv.lock().unwrap();
+        let unparsed_vv = self.unparsed_vv.lock();
         if !unparsed_vv.contains_key(&peer) || self.vv[&peer] >= unparsed_vv[&peer] {
             return;
         }
@@ -290,16 +290,16 @@ impl AppDag {
         assert!(!nodes.is_empty());
         let mut map_guard = None;
         let map = map_input.unwrap_or_else(|| {
-            map_guard = Some(self.map.lock().unwrap());
+            map_guard = Some(self.map.lock());
             map_guard.as_mut().unwrap()
         });
         let new_dag_start_counter_for_the_peer = nodes[0].cnt;
         let nodes_cnt_end = nodes.last().unwrap().ctr_end();
-        let mut unparsed_vv = self.unparsed_vv.lock().unwrap();
+        let mut unparsed_vv = self.unparsed_vv.lock();
         let end_counter = unparsed_vv[&peer];
         assert!(end_counter <= nodes_cnt_end);
         let mut deps_on_others = Vec::new();
-        let mut break_point_set = self.unhandled_dep_points.lock().unwrap();
+        let mut break_point_set = self.unhandled_dep_points.lock();
         for mut node in nodes {
             if node.cnt >= end_counter {
                 // skip already parsed nodes
@@ -364,7 +364,7 @@ impl AppDag {
     ) {
         let mut map_guard = None;
         let map = map.unwrap_or_else(|| {
-            map_guard = Some(self.map.lock().unwrap());
+            map_guard = Some(self.map.lock());
             map_guard.as_mut().unwrap()
         });
         for id in ids {
@@ -397,7 +397,7 @@ impl AppDag {
             if let Some(new_node) = ans {
                 map.insert(new_node.id_start(), new_node);
             } else if !handled {
-                self.unhandled_dep_points.lock().unwrap().insert(id);
+                self.unhandled_dep_points.lock().insert(id);
             }
         }
     }
@@ -411,7 +411,7 @@ impl AppDag {
             // We need to load all the dag nodes that has the same peer and greater counter than the given `id`
             // Because we only record the end counter of the unparsed version on `unparsed_vv`
             let unparsed_end = {
-                let unparsed_vv = self.unparsed_vv.lock().unwrap();
+                let unparsed_vv = self.unparsed_vv.lock();
                 unparsed_vv.get(&id.peer).copied().unwrap_or(0)
             };
             if unparsed_end <= id.counter {
@@ -431,12 +431,12 @@ impl AppDag {
     }
 
     pub fn total_parsed_dag_node(&self) -> usize {
-        self.map.lock().unwrap().len()
+        self.map.lock().len()
     }
 
     pub(crate) fn set_version_by_fast_snapshot_import(&mut self, v: BatchDecodeInfo) {
         assert!(self.vv.is_empty());
-        *self.unparsed_vv.lock().unwrap() = v.vv.clone();
+        *self.unparsed_vv.lock() = v.vv.clone();
         self.vv = v.vv;
         self.frontiers = v.frontiers;
         if let Some((vv, f)) = v.start_version {
@@ -465,7 +465,7 @@ impl AppDag {
     pub fn check_dag_correctness(&self) {
         {
             // parse all nodes
-            let unparsed_vv = self.unparsed_vv.lock().unwrap().clone();
+            let unparsed_vv = self.unparsed_vv.lock().clone();
             for (peer, cnt) in unparsed_vv.iter() {
                 if *cnt == 0 {
                     continue;
@@ -476,21 +476,15 @@ impl AppDag {
                 while end_cnt > init_counter {
                     let cnt = end_cnt - 1;
                     self.ensure_lazy_load_node(ID::new(*peer, cnt));
-                    end_cnt = self
-                        .unparsed_vv
-                        .lock()
-                        .unwrap()
-                        .get(peer)
-                        .copied()
-                        .unwrap_or(0);
+                    end_cnt = self.unparsed_vv.lock().get(peer).copied().unwrap_or(0);
                 }
             }
 
-            self.unparsed_vv.lock().unwrap().clear();
+            self.unparsed_vv.lock().clear();
         }
         {
             // check property 1: Counter is continuous
-            let map = self.map.lock().unwrap();
+            let map = self.map.lock();
             let mut last_end_id = ID::new(0, 0);
             for (&id, node) in map.iter() {
                 let init_counter = self.shallow_since_vv.get(&id.peer).copied().unwrap_or(0);
@@ -505,12 +499,12 @@ impl AppDag {
         }
         {
             // check property 2: A node always depends of the last ids of other nodes
-            let map = self.map.lock().unwrap();
+            let map = self.map.lock();
             check_always_dep_on_last_id(&map);
         }
         {
             // check property 3: Lamport is correctly calculated
-            let map = self.map.lock().unwrap();
+            let map = self.map.lock();
             'outer: for (_, node) in map.iter() {
                 let mut this_lamport = 0;
                 for dep in node.deps.iter() {
@@ -527,7 +521,7 @@ impl AppDag {
         }
         {
             // check property 4: VV for each node is correctly calculated
-            let map = self.map.lock().unwrap().clone();
+            let map = self.map.lock().clone();
             'outer: for (_, node) in map.iter() {
                 let actual_vv = self.ensure_vv_for(node);
                 let mut expected_vv = ImVersionVector::default();
@@ -548,7 +542,7 @@ impl AppDag {
         {
             // check property 5: Frontiers are correctly calculated
             let mut maybe_frontiers = FxHashSet::default();
-            let map = self.map.lock().unwrap();
+            let map = self.map.lock();
             for (_, node) in map.iter() {
                 maybe_frontiers.insert(node.id_last());
             }
@@ -824,7 +818,7 @@ impl Dag for AppDag {
 
     fn get(&self, id: ID) -> Option<Self::Node> {
         self.ensure_lazy_load_node(id);
-        let binding = self.map.lock().unwrap();
+        let binding = self.map.lock();
         if let Some(x) = binding.range(..=id).next_back() {
             if x.1.contains_id(id) {
                 // PERF: do we need to optimize clone like this?
@@ -866,16 +860,19 @@ impl AppDag {
 
     pub(crate) fn ensure_vv_for(&self, target_node: &AppDagNode) -> ImVersionVector {
         if target_node.vv.get().is_none() {
-            // (node, has_processed_children)
+            // Iterative DFS. When the DAG contains a diamond, a dep can end
+            // up on the stack multiple times (once for each ancestor that
+            // re-queued the current node before its deps were ready). We
+            // skip nodes whose vv has already been computed — the original
+            // code eagerly called `OnceCell::set(..).unwrap()` on every pop
+            // and panicked on the second visit (see loro-dev/loro#929).
             let mut stack: SmallVec<[AppDagNode; 4]> = smallvec::smallvec![target_node.clone()];
             while let Some(top_node) = stack.pop() {
+                if top_node.vv.get().is_some() {
+                    continue;
+                }
+
                 let mut ans_vv = ImVersionVector::default();
-                // trace!("node={:?} {:?}", &top_node, has_all_deps_met);
-                // trace!("deps={:?}", &top_node.deps);
-                // trace!("this.shallow_f_deps={:?}", &self.shallow_frontiers_deps);
-                // trace!("this.vv={:?}", &self.vv);
-                // trace!("this.unparsed_vv={:?}", &self.unparsed_vv);
-                // trace!("this.shallow_since_vv={:?}", &self.shallow_since_vv);
                 if top_node.deps == self.shallow_root_frontiers_deps {
                     for (&p, &c) in self.shallow_since_vv.iter() {
                         ans_vv.insert(p, c);
@@ -885,7 +882,6 @@ impl AppDag {
                     for id in top_node.deps.iter() {
                         let node = self.get(id).expect("deps should be in the dag");
                         if node.vv.get().is_none() {
-                            // assert!(!has_all_deps_met);
                             if all_deps_processed {
                                 stack.push(top_node.clone());
                             }
@@ -912,8 +908,10 @@ impl AppDag {
                     }
                 }
 
-                // trace!("ans_vv={:?}", &ans_vv);
-                top_node.vv.set(ans_vv.clone()).unwrap();
+                // Tolerate a racing set from the diamond case above: if
+                // another path already initialized this cell, trust that
+                // value (it was computed from the same DAG) and move on.
+                let _ = top_node.vv.set(ans_vv);
             }
         }
 
@@ -1127,5 +1125,70 @@ pub struct FrontiersNotIncluded;
 impl Display for FrontiersNotIncluded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("The given Frontiers are not included by the doc")
+    }
+}
+
+#[cfg(test)]
+mod ensure_vv_for_tests {
+    use super::*;
+    use crate::arena::SharedArena;
+    use std::sync::atomic::AtomicI64;
+
+    fn make_dag_node(peer: PeerID, cnt: Counter, len: usize, deps: Frontiers) -> AppDagNode {
+        AppDagNodeInner {
+            vv: OnceCell::new(),
+            peer,
+            cnt,
+            lamport: cnt as Lamport,
+            deps,
+            has_succ: false,
+            len,
+        }
+        .into()
+    }
+
+    /// Regression for loro-dev/loro#929: when computing the vv for a node
+    /// whose DAG fan-in contains a shared ancestor reached through multiple
+    /// paths, the iterative DFS used to push the shared ancestor onto the
+    /// stack twice. The second visit would then call `OnceCell::set(..)
+    /// .unwrap()` on an already-initialized cell and panic with
+    /// "called `Result::unwrap()` on an `Err` value: ImVersionVector(..)".
+    ///
+    /// Topology:
+    ///    x (peer 1, counter 0)
+    ///    |
+    ///    y (peer 2, counter 0, deps = [x])
+    ///    |
+    ///    z (peer 3, counter 0, deps = [x, y])
+    ///
+    /// When we call `ensure_vv_for(z)`, z pushes x and y. Processing y then
+    /// re-pushes x (still uninitialized), so the stack ends up with two
+    /// copies of x; the second pop must be a no-op after the fix.
+    #[test]
+    fn diamond_dep_ensure_vv_for_does_not_double_set() {
+        let change_store = ChangeStore::new_mem(&SharedArena::new(), Arc::new(AtomicI64::new(0)));
+        let dag = AppDag::new(change_store);
+
+        let x = make_dag_node(1, 0, 1, Frontiers::default());
+        let y = make_dag_node(2, 0, 1, Frontiers::from_id(ID::new(1, 0)));
+        let mut z_deps = Frontiers::default();
+        z_deps.push(ID::new(1, 0));
+        z_deps.push(ID::new(2, 0));
+        let z = make_dag_node(3, 0, 1, z_deps);
+
+        {
+            let mut map = dag.map.lock();
+            map.insert(x.id_start(), x);
+            map.insert(y.id_start(), y);
+            map.insert(z.id_start(), z.clone());
+        }
+
+        // Historically this panicked at the inner `vv.set(...).unwrap()`.
+        // `ensure_vv_for` returns the vv *at* the node: it covers every
+        // peer in the causal past, but not the node's own peer counter.
+        let vv = dag.ensure_vv_for(&z);
+        assert_eq!(vv.get(&1).copied(), Some(1));
+        assert_eq!(vv.get(&2).copied(), Some(1));
+        assert!(vv.get(&3).is_none());
     }
 }

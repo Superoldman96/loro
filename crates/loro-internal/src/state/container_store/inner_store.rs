@@ -133,7 +133,7 @@ impl InnerStore {
     }
 
     pub(crate) fn flush(&mut self) {
-        let deleted = self.config.deleted_root_containers.lock().unwrap();
+        let deleted = self.config.deleted_root_containers.lock();
         self.kv
             .set_all(self.store.iter_mut().filter_map(|(idx, c)| {
                 if c.is_flushed() {

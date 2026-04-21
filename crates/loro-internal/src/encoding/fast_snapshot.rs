@@ -135,13 +135,7 @@ pub(crate) fn decode_snapshot_inner(
         shallow_root_state_bytes,
     } = snapshot;
     ensure_cov::notify_cov("loro_internal::import::fast_snapshot::decode_snapshot");
-    let mut oplog = doc.oplog().lock().map_err(|_| {
-        LoroError::DecodeError(
-            "decode_snapshot: failed to lock oplog"
-                .to_string()
-                .into_boxed_str(),
-        )
-    })?;
+    let mut oplog = doc.oplog().lock();
     if !oplog.is_empty() {
         return Err(LoroError::DecodeError(
             "decode_snapshot: cannot import snapshot into a non-empty doc"
@@ -150,13 +144,7 @@ pub(crate) fn decode_snapshot_inner(
         ));
     }
 
-    let mut state = doc.app_state().lock().map_err(|_| {
-        LoroError::DecodeError(
-            "decode_snapshot: failed to lock app state"
-                .to_string()
-                .into_boxed_str(),
-        )
-    })?;
+    let mut state = doc.app_state().lock();
 
     state.check_before_decode_snapshot()?;
 
@@ -218,7 +206,7 @@ pub(crate) fn decode_snapshot_inner(
     // FIXME: we may need to extract the unknown containers here?
     // Or we should lazy load it when the time comes?
 
-    state.init_with_states_and_version(state_frontiers, &oplog, vec![], false, origin);
+    state.init_with_states_and_version(state_frontiers, &oplog, vec![], false, origin)?;
     drop(state);
     drop(oplog);
     if need_calc {
@@ -247,8 +235,8 @@ pub(crate) fn encode_snapshot_inner(doc: &LoroDoc) -> Snapshot {
     assert!(doc.drop_pending_events().is_empty());
     let old_state_frontiers = doc.state_frontiers();
     let was_detached = doc.is_detached();
-    let oplog = doc.oplog().lock().unwrap();
-    let mut state = doc.app_state().lock().unwrap();
+    let oplog = doc.oplog().lock();
+    let mut state = doc.app_state().lock();
     let is_gc = state.store.shallow_root_store().is_some();
     if is_gc {
         // TODO: PERF: this can be optimized by reusing the bytes of gc store
@@ -273,7 +261,7 @@ pub(crate) fn encode_snapshot_inner(doc: &LoroDoc) -> Snapshot {
         drop(oplog);
         doc._checkout_without_emitting(&latest, false, true)
             .unwrap();
-        state = doc.app_state().lock().unwrap();
+        state = doc.app_state().lock();
     }
     state.ensure_all_alive_containers();
     let state_bytes = state.store.encode();
@@ -293,8 +281,17 @@ pub(crate) fn encode_snapshot_inner(doc: &LoroDoc) -> Snapshot {
 }
 
 pub(crate) fn decode_oplog(oplog: &mut OpLog, bytes: &[u8]) -> Result<Vec<Change>, LoroError> {
-    let oplog_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    let oplog_bytes = &bytes[4..4 + oplog_len as usize];
+    let oplog_len = bytes
+        .get(0..4)
+        .ok_or_else(|| LoroError::DecodeError("decode_oplog: missing length prefix".into()))?;
+    let oplog_len = u32::from_le_bytes(
+        oplog_len
+            .try_into()
+            .expect("slice length checked to be exactly 4"),
+    ) as usize;
+    let oplog_bytes = bytes
+        .get(4..4 + oplog_len)
+        .ok_or_else(|| LoroError::DecodeError("decode_oplog: invalid oplog length".into()))?;
     let mut changes = ChangeStore::decode_snapshot_for_updates(
         oplog_bytes.to_vec().into(),
         &oplog.arena,
@@ -305,7 +302,7 @@ pub(crate) fn decode_oplog(oplog: &mut OpLog, bytes: &[u8]) -> Result<Vec<Change
 }
 
 pub(crate) fn encode_updates<W: std::io::Write>(doc: &LoroDoc, vv: &VersionVector, w: &mut W) {
-    let oplog = doc.oplog().lock().unwrap();
+    let oplog = doc.oplog().lock();
     oplog.export_blocks_from(vv, w);
 }
 
@@ -324,17 +321,41 @@ pub(crate) fn decode_updates(oplog: &mut OpLog, body: Bytes) -> Result<Vec<Chang
     let mut changes = Vec::new();
     while !reader.is_empty() {
         let old_reader_len = reader.len();
-        let len = leb128::read::unsigned(&mut reader).unwrap() as usize;
+        let len = leb128::read::unsigned(&mut reader)
+            .map_err(|_| LoroError::DecodeError("decode_updates: invalid block length".into()))?
+            as usize;
         index += old_reader_len - reader.len();
-        let block_bytes = body.slice(index..index + len);
+        let end = index.checked_add(len).ok_or_else(|| {
+            LoroError::DecodeError("decode_updates: block length overflow".into())
+        })?;
+        if end > body.len() {
+            return Err(LoroError::DecodeError(
+                "decode_updates: truncated block payload".into(),
+            ));
+        }
+        let block_bytes = body.slice(index..end);
         let new_changes = ChangeStore::decode_block_bytes(block_bytes, &oplog.arena, self_vv)?;
         changes.extend(new_changes);
-        index += len;
+        index = end;
         reader = &reader[len..];
     }
 
     changes.sort_unstable_by_key(|x| x.lamport);
     Ok(changes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_updates_rejects_truncated_block() {
+        let doc = LoroDoc::new();
+        let mut oplog = doc.oplog.lock();
+        let err = decode_updates(&mut oplog, Bytes::from_static(&[0x02, 0x01]))
+            .expect_err("truncated update block should be rejected");
+        assert!(matches!(err, LoroError::DecodeError(_)));
+    }
 }
 
 pub(crate) fn decode_snapshot_blob_meta(
@@ -348,7 +369,7 @@ pub(crate) fn decode_snapshot_blob_meta(
     };
 
     let doc = LoroDoc::new();
-    let mut oplog = doc.oplog.lock().unwrap();
+    let mut oplog = doc.oplog.lock();
     oplog.decode_change_store(oplog_bytes.to_vec().into())?;
     let timestamp = oplog.get_greatest_timestamp(oplog.dag.frontiers());
     let f = oplog.dag.shallow_since_frontiers().clone();
@@ -370,7 +391,7 @@ pub(crate) fn decode_updates_blob_meta(
     parsed: ParsedHeaderAndBody,
 ) -> LoroResult<ImportBlobMetadata> {
     let doc = LoroDoc::new();
-    let mut oplog = doc.oplog.lock().unwrap();
+    let mut oplog = doc.oplog.lock();
     let changes = decode_updates(&mut oplog, parsed.body.to_vec().into())?;
     let mut start_vv = VersionVector::new();
     let mut end_vv = VersionVector::new();
