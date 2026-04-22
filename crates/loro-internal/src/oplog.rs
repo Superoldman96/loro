@@ -11,8 +11,8 @@ use std::rc::Rc;
 use tracing::trace_span;
 
 use self::change_store::iter::MergedChangeIter;
-use self::pending_changes::PendingChanges;
-use super::arena::SharedArena;
+use self::pending_changes::{PendingChanges, PendingChangesRollback};
+use super::arena::{SharedArena, SharedArenaRollback};
 use crate::change::{get_sys_timestamp, Change, Lamport, Timestamp};
 use crate::configure::Configure;
 use crate::container::list::list_op;
@@ -26,8 +26,8 @@ use crate::op::{FutureInnerContent, ListSlice, RawOpContent, RemoteOp, RichOp};
 use crate::span::{HasCounterSpan, HasLamportSpan};
 use crate::version::{Frontiers, ImVersionVector, VersionVector};
 use crate::LoroError;
-use change_store::BlockOpRef;
-use loro_common::{HasIdSpan, IdLp, IdSpan};
+use change_store::{BlockOpRef, ChangeStoreRollback};
+use loro_common::{ContainerType, HasIdSpan, IdLp, IdSpan};
 use rle::{HasLength, RleVec, Sliceable};
 use smallvec::SmallVec;
 
@@ -57,6 +57,21 @@ pub struct OpLog {
     /// The uncommitted change, it's a placeholder for the change
     /// that is being edited in pre-commit callback.
     pub(crate) uncommitted_change: Option<Change>,
+    pub(crate) import_rollback: Option<ImportRollback>,
+}
+
+pub(crate) struct ImportRollback {
+    old_vv: VersionVector,
+    arena: SharedArenaRollback,
+    change_store: ChangeStoreRollback,
+    pending: PendingChangesRollback,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ImportChangesPreflight {
+    pub applies_to_dag: bool,
+    pub has_deps_before_shallow_root: bool,
+    pub needs_state_apply_rollback: bool,
 }
 
 impl std::fmt::Debug for OpLog {
@@ -83,6 +98,7 @@ impl OpLog {
             batch_importing: false,
             configure: cfg,
             uncommitted_change: None,
+            import_rollback: None,
         }
     }
 
@@ -135,12 +151,128 @@ impl OpLog {
             deps = ?change.deps
         );
         let _enter = s.enter();
-        self.dag.handle_new_change(&change, from_local);
+        let rollback_old_vv = self
+            .import_rollback
+            .as_ref()
+            .and_then(|x| (!x.old_vv.is_empty()).then_some(&x.old_vv));
+        self.dag
+            .handle_new_change(&change, from_local, rollback_old_vv);
         self.history_cache
             .lock()
             .insert_by_new_change(&change, true, true);
         self.register_container_and_parent_link(&change);
-        self.change_store.insert_change(change, true, from_local);
+        if let Some(rollback) = self.import_rollback.as_mut() {
+            self.change_store.insert_change_with_rollback(
+                change,
+                true,
+                from_local,
+                &mut rollback.change_store,
+            );
+        } else {
+            self.change_store.insert_change(change, true, from_local);
+        }
+    }
+
+    pub(crate) fn begin_import_rollback(&mut self) {
+        let arena = self.arena.checkpoint_for_rollback();
+        self.begin_import_rollback_with_arena(arena);
+    }
+
+    pub(crate) fn begin_import_rollback_with_arena(&mut self, arena: SharedArenaRollback) {
+        debug_assert!(self.import_rollback.is_none());
+        let old_vv = self.vv().clone();
+        self.dag.begin_import_rollback();
+        self.import_rollback = Some(ImportRollback {
+            old_vv: old_vv.clone(),
+            arena,
+            change_store: ChangeStoreRollback::new(old_vv),
+            pending: Default::default(),
+        });
+    }
+
+    pub(crate) fn commit_import_rollback(&mut self) {
+        self.dag.commit_import_rollback();
+        self.import_rollback = None;
+    }
+
+    pub(crate) fn preflight_import_changes(&self, changes: &[Change]) -> ImportChangesPreflight {
+        let mut ans = ImportChangesPreflight::default();
+        let pending_needs_state_apply_rollback =
+            self.pending_changes.has_state_apply_rollback_ops();
+        for change in changes {
+            if change.ctr_end() <= self.vv().get(&change.id.peer).copied().unwrap_or(0) {
+                continue;
+            }
+
+            if self.dag.is_before_shallow_root(&change.deps) {
+                ans.has_deps_before_shallow_root = true;
+                continue;
+            }
+
+            if self
+                .dag
+                .get_change_lamport_from_deps(&change.deps)
+                .is_none()
+            {
+                continue;
+            }
+
+            ans.applies_to_dag = true;
+            if change.ops.iter().any(|op| {
+                matches!(
+                    op.container.get_type(),
+                    ContainerType::List | ContainerType::Tree
+                )
+            }) {
+                ans.needs_state_apply_rollback = true;
+            }
+        }
+
+        // Any newly applied change can unlock pending changes whose ops are not
+        // visible in `changes`, so include pending in the rollback decision.
+        // Keep this narrow: text/map-only pending changes cannot return a
+        // state-apply error, and forcing rollback there adds lock traffic to
+        // small sync/import workloads.
+        if ans.applies_to_dag && pending_needs_state_apply_rollback {
+            ans.needs_state_apply_rollback = true;
+        }
+
+        #[cfg(test)]
+        if ans.applies_to_dag {
+            ans.needs_state_apply_rollback = true;
+        }
+
+        ans
+    }
+
+    pub(crate) fn rollback_import(&mut self) {
+        let Some(rollback) = self.import_rollback.take() else {
+            return;
+        };
+
+        self.change_store.rollback_import(rollback.change_store);
+        self.dag.rollback_import();
+        rollback.pending.rollback(&mut self.pending_changes);
+        self.history_cache.lock().free_all();
+        self.arena.rollback(rollback.arena);
+    }
+
+    pub(crate) fn reset_to_empty_for_failed_snapshot_import(
+        &mut self,
+        arena_checkpoint: SharedArenaRollback,
+    ) {
+        let arena = self.arena.clone();
+        let configure = self.configure.clone();
+        arena.rollback(arena_checkpoint);
+        let change_store = ChangeStore::new_mem(&arena, configure.merge_interval_in_s.clone());
+        self.history_cache = Mutex::new(ContainerHistoryCache::new(change_store.clone(), None));
+        self.dag = AppDag::new(change_store.clone());
+        self.change_store = change_store;
+        self.pending_changes = Default::default();
+        self.batch_importing = false;
+        self.configure = configure;
+        self.uncommitted_change = None;
+        self.import_rollback = None;
     }
 
     #[inline(always)]
@@ -159,6 +291,12 @@ impl OpLog {
     pub fn free_history_cache(&self) {
         let mut history_cache = self.history_cache.lock();
         history_cache.free();
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn pending_changes_len(&self) -> usize {
+        self.pending_changes.len()
     }
 
     /// Import a change.
