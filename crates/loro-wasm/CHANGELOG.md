@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.12.1
+
+### Patch Changes
+
+- 2159110: Fix Emscripten builds by using the native system timestamp path instead of the wasm-bindgen Date.now binding.
+- 658fdc6: Reject malformed import blob metadata instead of panicking when decoding unchecked import blobs.
+
 ## 1.12.0
 
 ### Minor Changes
