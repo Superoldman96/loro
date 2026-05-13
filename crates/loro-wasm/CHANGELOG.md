@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.12.2
+
+### Patch Changes
+
+- cc587ed: Add a browser package remapping so Vite/Rolldown production builds load WASM without top-level await or circular wasm wrapper chunks.
+
+  Also make the base64 entry easier to bundle with plain esbuild, Rollup, and Next.js Webpack by avoiding static Node builtin `require()` calls and top-level await in browser bundles.
+
+- 5bfffd7: Fix panic in `UndoManager` when `maxUndoSteps` trimming encounters an empty front stack row left by a prior undo with remote diffs.
+
 ## 1.12.1
 
 ### Patch Changes
